@@ -1,0 +1,5 @@
+node_modules
+.env
+.DS_Store
+atlas-credentials.env
+ptwop-e0552-firebase-adminsdk-fbsvc-245f0c0a22.json
