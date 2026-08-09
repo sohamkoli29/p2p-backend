@@ -1,5 +1,8 @@
+const dns = require('dns')
+require('dns').setServers(['8.8.8.8', '8.8.4.4'])
 const express = require('express')
 const cors = require('cors')
+
 require('dotenv').config()
 
 const healthRoutes = require('./routes/health')
