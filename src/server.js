@@ -1,11 +1,11 @@
-const dns = require('dns')
 require('dns').setServers(['8.8.8.8', '8.8.4.4'])
+
 const express = require('express')
 const cors = require('cors')
-
 require('dotenv').config()
 
 const healthRoutes = require('./routes/health')
+const profileRoutes = require('./routes/profile')
 const { connectMongo } = require('./config/mongodb')
 
 const app = express()
@@ -15,6 +15,7 @@ app.use(cors({ origin: process.env.CLIENT_URL || '*' }))
 app.use(express.json())
 
 app.use('/api/health', healthRoutes)
+app.use('/api/profile', profileRoutes)
 
 async function start() {
   try {
