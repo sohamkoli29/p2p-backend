@@ -6,6 +6,7 @@ require('dotenv').config()
 
 const healthRoutes = require('./routes/health')
 const profileRoutes = require('./routes/profile')
+const requisitionRoutes = require('./routes/requisitions')
 const { connectMongo } = require('./config/mongodb')
 
 const app = express()
@@ -16,6 +17,7 @@ app.use(express.json())
 
 app.use('/api/health', healthRoutes)
 app.use('/api/profile', profileRoutes)
+app.use('/api/requisitions', requisitionRoutes)
 
 async function start() {
   try {
