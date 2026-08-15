@@ -23,7 +23,6 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
     }
   }
 
-  // Confirm the requisition exists and is approved
   const { data: pr, error: prError } = await supabase
     .from('purchase_requisitions')
     .select('id, status, department')
@@ -35,7 +34,6 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: 'Only approved requisitions can be sourced via RFQ.' })
   }
 
-  // Confirm the chosen line items actually belong to this requisition
   const { data: prItems, error: prItemsError } = await supabase
     .from('pr_line_items')
     .select('id')
@@ -49,7 +47,6 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: 'One or more line items do not belong to this requisition.' })
   }
 
-  // Confirm vendor_ids are real vendor accounts
   const { data: vendors, error: vendorsError } = await supabase
     .from('profiles')
     .select('id')
@@ -61,7 +58,6 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: 'One or more selected vendors are invalid.' })
   }
 
-  // Create the RFQ
   const { data: rfq, error: rfqError } = await supabase
     .from('rfqs')
     .insert({ requisition_id, created_by: req.profile.id, deadline, status: 'open' })
@@ -70,7 +66,6 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
 
   if (rfqError) return res.status(500).json({ error: rfqError.message })
 
-  // Create rfq_items
   const rfqItems = items.map((item) => ({
     rfq_id: rfq.id,
     pr_line_item_id: item.pr_line_item_id,
@@ -79,11 +74,10 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
 
   const { error: itemsError } = await supabase.from('rfq_items').insert(rfqItems)
   if (itemsError) {
-    await supabase.from('rfqs').delete().eq('id', rfq.id) // cascades rfq_items/rfq_vendors
+    await supabase.from('rfqs').delete().eq('id', rfq.id)
     return res.status(500).json({ error: itemsError.message })
   }
 
-  // Create rfq_vendors (the invite list)
   const rfqVendors = vendor_ids.map((vendor_id) => ({ rfq_id: rfq.id, vendor_id }))
   const { error: vendorInsertError } = await supabase.from('rfq_vendors').insert(rfqVendors)
   if (vendorInsertError) {
@@ -101,6 +95,27 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
   }).catch((err) => console.error('notifyVendors failed:', err.message))
 
   res.status(201).json({ ...rfq, items: rfqItems, vendor_ids })
+})
+
+// GET /api/rfqs/mine — vendor: RFQs this vendor has been invited to
+// Must stay before GET /:id, or Express treats "mine" as an :id value.
+router.get('/mine', verifyToken, requireRole('vendor'), async (req, res) => {
+  const { data: invites, error } = await supabase
+    .from('rfq_vendors')
+    .select('responded, invited_at, rfqs(*, purchase_requisitions(department), rfq_items(id))')
+    .eq('vendor_id', req.profile.id)
+    .order('invited_at', { ascending: false })
+
+  if (error) return res.status(500).json({ error: error.message })
+
+  const enriched = invites.map((inv) => ({
+    ...inv.rfqs,
+    department: inv.rfqs?.purchase_requisitions?.department,
+    item_count: inv.rfqs?.rfq_items?.length ?? 0,
+    responded: inv.responded,
+  }))
+
+  res.json(enriched)
 })
 
 // GET /api/rfqs — admin: list all RFQs
@@ -123,6 +138,8 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
 })
 
 // GET /api/rfqs/:id — admin (full access) or an invited vendor
+// For vendors, also attaches their own quotation (if any) so the frontend
+// can render a read-only "already quoted" view instead of the form.
 router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params
 
@@ -146,7 +163,18 @@ router.get('/:id', verifyToken, async (req, res) => {
     return res.status(403).json({ error: 'You do not have access to this RFQ.' })
   }
 
-  res.json(rfq)
+  let myQuotation = null
+  if (req.profile.role === 'vendor') {
+    const { data: quotation } = await supabase
+      .from('quotations')
+      .select('*, quotation_items(*)')
+      .eq('rfq_id', id)
+      .eq('vendor_id', req.profile.id)
+      .maybeSingle()
+    myQuotation = quotation || null
+  }
+
+  res.json({ ...rfq, my_quotation: myQuotation })
 })
 
 module.exports = router
