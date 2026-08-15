@@ -3,8 +3,9 @@ const router = express.Router()
 const supabase = require('../config/supabase')
 const verifyToken = require('../middleware/auth')
 const requireRole = require('../middleware/requireRole')
+const { notifyAdmins, notifyUser } = require('../services/notifications')
 
-// POST /api/requisitions — create a PR with line items (Day 5)
+// POST /api/requisitions
 router.post('/', verifyToken, requireRole('alemic'), async (req, res) => {
   const { department, justification, status, items } = req.body
 
@@ -54,12 +55,21 @@ router.post('/', verifyToken, requireRole('alemic'), async (req, res) => {
     return res.status(500).json({ error: itemsError.message })
   }
 
+  // Fire-and-forget: don't let a notification failure break PR creation
+  if (status === 'submitted') {
+    notifyAdmins({
+      title: 'New requisition awaiting approval',
+      message: `${req.profile.full_name} (${department}) submitted a requisition.`,
+      link: `/admin/requisitions/${pr.id}`,
+      entityId: pr.id,
+      type: 'pr_submitted',
+    }).catch((err) => console.error('notifyAdmins failed:', err.message))
+  }
+
   res.status(201).json({ ...pr, items: lineItems })
 })
 
-// GET /api/requisitions/mine — the logged-in alemic's own requisitions (Day 5)
-// NOTE: this must stay registered before GET /:id, or Express will treat
-// "mine" as an :id value.
+// GET /api/requisitions/mine
 router.get('/mine', verifyToken, requireRole('alemic'), async (req, res) => {
   const { data, error } = await supabase
     .from('purchase_requisitions')
@@ -67,14 +77,11 @@ router.get('/mine', verifyToken, requireRole('alemic'), async (req, res) => {
     .eq('requested_by', req.profile.id)
     .order('created_at', { ascending: false })
 
-  if (error) {
-    return res.status(500).json({ error: error.message })
-  }
-
+  if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
 
-// GET /api/requisitions — admin: list all, optionally filtered by ?status=
+// GET /api/requisitions — admin, optionally filtered by ?status=
 router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   const { status } = req.query
 
@@ -83,19 +90,12 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
     .select('*, pr_line_items(*)')
     .order('created_at', { ascending: false })
 
-  if (status) {
-    query = query.eq('status', status)
-  }
+  if (status) query = query.eq('status', status)
 
   const { data: requisitions, error } = await query
   if (error) return res.status(500).json({ error: error.message })
+  if (requisitions.length === 0) return res.json([])
 
-  if (requisitions.length === 0) {
-    return res.json([])
-  }
-
-  // Attach requester name/department manually — avoids depending on
-  // Supabase's auto-generated foreign key constraint name for embeds.
   const requesterIds = [...new Set(requisitions.map((pr) => pr.requested_by))]
   const { data: requesters, error: reqError } = await supabase
     .from('profiles')
@@ -105,15 +105,12 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   if (reqError) return res.status(500).json({ error: reqError.message })
 
   const requesterMap = Object.fromEntries(requesters.map((r) => [r.id, r]))
-  const enriched = requisitions.map((pr) => ({
-    ...pr,
-    requester: requesterMap[pr.requested_by] || null,
-  }))
+  const enriched = requisitions.map((pr) => ({ ...pr, requester: requesterMap[pr.requested_by] || null }))
 
   res.json(enriched)
 })
 
-// GET /api/requisitions/:id — admin (any PR) or alemic (own PR only)
+// GET /api/requisitions/:id
 router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params
 
@@ -140,7 +137,7 @@ router.get('/:id', verifyToken, async (req, res) => {
   res.json({ ...pr, requester })
 })
 
-// PATCH /api/requisitions/:id — admin: approve or reject a submitted PR
+// PATCH /api/requisitions/:id — approve/reject
 router.patch('/:id', verifyToken, requireRole('admin'), async (req, res) => {
   const { id } = req.params
   const { status, admin_notes } = req.body
@@ -151,7 +148,7 @@ router.patch('/:id', verifyToken, requireRole('admin'), async (req, res) => {
 
   const { data: existing, error: fetchError } = await supabase
     .from('purchase_requisitions')
-    .select('status')
+    .select('status, requested_by, department')
     .eq('id', id)
     .single()
 
@@ -173,6 +170,16 @@ router.patch('/:id', verifyToken, requireRole('admin'), async (req, res) => {
     .single()
 
   if (error) return res.status(500).json({ error: error.message })
+
+  notifyUser({
+    userId: existing.requested_by,
+    title: status === 'approved' ? 'Requisition approved' : 'Requisition returned',
+    message: `Your requisition for ${existing.department} was ${status}.`,
+    link: `/dept/requisitions/${id}`,
+    entityId: id,
+    type: status === 'approved' ? 'pr_approved' : 'pr_rejected',
+  }).catch((err) => console.error('notifyUser failed:', err.message))
+
   res.json(data)
 })
 
