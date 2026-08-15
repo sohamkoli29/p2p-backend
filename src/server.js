@@ -8,6 +8,8 @@ const healthRoutes = require('./routes/health')
 const profileRoutes = require('./routes/profile')
 const requisitionRoutes = require('./routes/requisitions')
 const authRoutes = require('./routes/auth')
+const vendorRoutes = require('./routes/vendors')
+const rfqRoutes = require('./routes/rfqs')
 const { connectMongo } = require('./config/mongodb')
 
 const app = express()
@@ -20,6 +22,8 @@ app.use('/api/health', healthRoutes)
 app.use('/api/profile', profileRoutes)
 app.use('/api/requisitions', requisitionRoutes)
 app.use('/api/auth', authRoutes)
+app.use('/api/vendors', vendorRoutes)
+app.use('/api/rfqs', rfqRoutes)
 
 async function start() {
   try {

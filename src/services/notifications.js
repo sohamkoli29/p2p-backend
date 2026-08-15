@@ -35,4 +35,24 @@ async function notifyUser({ userId, title, message, link, entityId, type }) {
   })
 }
 
-module.exports = { notifyAdmins, notifyUser }
+async function notifyVendors({ vendorIds, title, message, link, entityId, type }) {
+  if (!vendorIds?.length) return
+
+  const batch = firestore.batch()
+  vendorIds.forEach((vendorId) => {
+    const ref = firestore.collection('notifications').doc()
+    batch.set(ref, {
+      recipient_id: vendorId,
+      type,
+      title,
+      message,
+      link,
+      entity_id: entityId,
+      read: false,
+      created_at: FieldValue.serverTimestamp(),
+    })
+  })
+  await batch.commit()
+}
+
+module.exports = { notifyAdmins, notifyUser, notifyVendors }
