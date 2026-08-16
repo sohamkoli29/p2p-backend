@@ -11,6 +11,7 @@ const authRoutes = require('./routes/auth')
 const vendorRoutes = require('./routes/vendors')
 const rfqRoutes = require('./routes/rfqs')
 const quotationRoutes = require('./routes/quotations')
+const purchaseOrderRoutes = require('./routes/purchaseOrders')
 const { connectMongo } = require('./config/mongodb')
 
 const app = express()
@@ -26,6 +27,7 @@ app.use('/api/auth', authRoutes)
 app.use('/api/vendors', vendorRoutes)
 app.use('/api/rfqs', rfqRoutes)
 app.use('/api/quotations', quotationRoutes)
+app.use('/api/purchase-orders', purchaseOrderRoutes)
 
 async function start() {
   try {

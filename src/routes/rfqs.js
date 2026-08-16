@@ -1,9 +1,16 @@
 const express = require('express')
+const crypto = require('crypto')
 const router = express.Router()
 const supabase = require('../config/supabase')
 const verifyToken = require('../middleware/auth')
 const requireRole = require('../middleware/requireRole')
 const { notifyVendors, notifyUser } = require('../services/notifications')
+
+function generatePoNumber() {
+  const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+  const randomPart = crypto.randomBytes(3).toString('hex').toUpperCase()
+  return `PO-${datePart}-${randomPart}`
+}
 
 // POST /api/rfqs — admin: create an RFQ from an approved PR
 router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
@@ -97,8 +104,7 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
   res.status(201).json({ ...rfq, items: rfqItems, vendor_ids })
 })
 
-// GET /api/rfqs/mine — vendor: RFQs this vendor has been invited to,
-// including their own quotation status so the list badge is accurate.
+// GET /api/rfqs/mine — vendor: invited RFQs, with quote status attached
 router.get('/mine', verifyToken, requireRole('vendor'), async (req, res) => {
   const { data: invites, error } = await supabase
     .from('rfq_vendors')
@@ -146,8 +152,7 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   res.json(enriched)
 })
 
-// GET /api/rfqs/:id — admin (full access, plus all quotations for comparison)
-// or an invited vendor (their own quotation only)
+// GET /api/rfqs/:id — admin (full, plus quotes + linked PO if awarded) or an invited vendor
 router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params
 
@@ -183,6 +188,7 @@ router.get('/:id', verifyToken, async (req, res) => {
   }
 
   let quotations = []
+  let purchaseOrder = null
   if (isAdmin) {
     const { data: allQuotes, error: quotesError } = await supabase
       .from('quotations')
@@ -191,12 +197,25 @@ router.get('/:id', verifyToken, async (req, res) => {
 
     if (quotesError) return res.status(500).json({ error: quotesError.message })
     quotations = allQuotes
+
+    if (rfq.status === 'awarded') {
+      const awardedQuote = quotations.find((q) => q.status === 'awarded')
+      if (awardedQuote) {
+        const { data: po } = await supabase
+          .from('purchase_orders')
+          .select('id, po_number, status, total_amount')
+          .eq('quotation_id', awardedQuote.id)
+          .maybeSingle()
+        purchaseOrder = po || null
+      }
+    }
   }
 
-  res.json({ ...rfq, my_quotation: myQuotation, quotations })
+  res.json({ ...rfq, my_quotation: myQuotation, quotations, purchase_order: purchaseOrder })
 })
 
-// PATCH /api/rfqs/:id/award — admin: award to one quotation, reject the rest, lock the RFQ
+// PATCH /api/rfqs/:id/award — admin: award to one quotation, reject the rest,
+// lock the RFQ, and auto-generate the resulting Purchase Order.
 router.patch('/:id/award', verifyToken, requireRole('admin'), async (req, res) => {
   const { id } = req.params
   const { quotation_id } = req.body
@@ -216,7 +235,7 @@ router.patch('/:id/award', verifyToken, requireRole('admin'), async (req, res) =
 
   const { data: quotation, error: quoteError } = await supabase
     .from('quotations')
-    .select('id, vendor_id, status')
+    .select('id, vendor_id, status, total_amount, quotation_items(*)')
     .eq('id', quotation_id)
     .eq('rfq_id', id)
     .single()
@@ -233,8 +252,6 @@ router.patch('/:id/award', verifyToken, requireRole('admin'), async (req, res) =
 
   if (awardError) return res.status(500).json({ error: awardError.message })
 
-  // Reject every other still-submitted quotation on this RFQ (winner is
-  // already 'awarded' at this point, so this query correctly skips it)
   const { data: rejected, error: rejectError } = await supabase
     .from('quotations')
     .update({ status: 'rejected' })
@@ -253,10 +270,49 @@ router.patch('/:id/award', verifyToken, requireRole('admin'), async (req, res) =
 
   if (rfqUpdateError) return res.status(500).json({ error: rfqUpdateError.message })
 
+  // Auto-generate the Purchase Order from the awarded quotation.
+  // Note: award + rejections above are already committed at this point —
+  // if PO generation fails, the award itself is NOT rolled back (Supabase's
+  // REST API has no cross-table transaction here). We clean up the PO shell
+  // on partial failure and surface a clear error so it can be fixed manually.
+  const poNumber = generatePoNumber()
+
+  const { data: po, error: poError } = await supabase
+    .from('purchase_orders')
+    .insert({
+      po_number: poNumber,
+      quotation_id: quotation.id,
+      status: 'issued',
+      total_amount: quotation.total_amount,
+    })
+    .select()
+    .single()
+
+  if (poError) {
+    return res.status(500).json({
+      error: `Quote was awarded but PO creation failed: ${poError.message}. The award is saved — retry PO generation manually.`,
+    })
+  }
+
+  const poItems = quotation.quotation_items.map((qi) => ({
+    po_id: po.id,
+    quotation_item_id: qi.id,
+    quantity: qi.quantity,
+    unit_price: qi.unit_price,
+  }))
+
+  const { error: poItemsError } = await supabase.from('po_items').insert(poItems)
+  if (poItemsError) {
+    await supabase.from('purchase_orders').delete().eq('id', po.id)
+    return res.status(500).json({
+      error: `Quote was awarded but PO line items failed to save: ${poItemsError.message}. The award is saved — retry PO generation manually.`,
+    })
+  }
+
   notifyUser({
     userId: quotation.vendor_id,
     title: 'Your quote was awarded',
-    message: 'Congratulations — your quote was selected. A purchase order will follow.',
+    message: `Congratulations — your quote was selected. Purchase order ${poNumber} has been issued.`,
     link: `/vendor/rfqs/${id}`,
     entityId: id,
     type: 'quote_awarded',
@@ -273,7 +329,7 @@ router.patch('/:id/award', verifyToken, requireRole('admin'), async (req, res) =
     }).catch((err) => console.error('notifyUser failed:', err.message))
   })
 
-  res.json({ rfq: updatedRfq, awarded_quotation_id: quotation_id })
+  res.json({ rfq: updatedRfq, awarded_quotation_id: quotation_id, purchase_order: po })
 })
 
 module.exports = router

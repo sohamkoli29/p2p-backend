@@ -55,7 +55,6 @@ router.post('/', verifyToken, requireRole('alemic'), async (req, res) => {
     return res.status(500).json({ error: itemsError.message })
   }
 
-  // Fire-and-forget: don't let a notification failure break PR creation
   if (status === 'submitted') {
     notifyAdmins({
       title: 'New requisition awaiting approval',
@@ -110,7 +109,8 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   res.json(enriched)
 })
 
-// GET /api/requisitions/:id
+// GET /api/requisitions/:id — includes the linked Purchase Order, if this
+// requisition has been fully sourced through an awarded RFQ.
 router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params
 
@@ -134,7 +134,35 @@ router.get('/:id', verifyToken, async (req, res) => {
     .eq('id', pr.requested_by)
     .single()
 
-  res.json({ ...pr, requester })
+  // Assumes at most one awarded RFQ per requisition — true for this MVP's
+  // single sourcing pass, but would need revisiting if re-sourcing is added.
+  let purchaseOrder = null
+  const { data: relatedRfq } = await supabase
+    .from('rfqs')
+    .select('id')
+    .eq('requisition_id', id)
+    .eq('status', 'awarded')
+    .maybeSingle()
+
+  if (relatedRfq) {
+    const { data: awardedQuote } = await supabase
+      .from('quotations')
+      .select('id')
+      .eq('rfq_id', relatedRfq.id)
+      .eq('status', 'awarded')
+      .maybeSingle()
+
+    if (awardedQuote) {
+      const { data: po } = await supabase
+        .from('purchase_orders')
+        .select('id, po_number, status, total_amount')
+        .eq('quotation_id', awardedQuote.id)
+        .maybeSingle()
+      purchaseOrder = po || null
+    }
+  }
+
+  res.json({ ...pr, requester, purchase_order: purchaseOrder })
 })
 
 // PATCH /api/requisitions/:id — approve/reject
