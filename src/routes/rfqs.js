@@ -3,7 +3,7 @@ const router = express.Router()
 const supabase = require('../config/supabase')
 const verifyToken = require('../middleware/auth')
 const requireRole = require('../middleware/requireRole')
-const { notifyVendors } = require('../services/notifications')
+const { notifyVendors, notifyUser } = require('../services/notifications')
 
 // POST /api/rfqs — admin: create an RFQ from an approved PR
 router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
@@ -97,8 +97,8 @@ router.post('/', verifyToken, requireRole('admin'), async (req, res) => {
   res.status(201).json({ ...rfq, items: rfqItems, vendor_ids })
 })
 
-// GET /api/rfqs/mine — vendor: RFQs this vendor has been invited to
-// Must stay before GET /:id, or Express treats "mine" as an :id value.
+// GET /api/rfqs/mine — vendor: RFQs this vendor has been invited to,
+// including their own quotation status so the list badge is accurate.
 router.get('/mine', verifyToken, requireRole('vendor'), async (req, res) => {
   const { data: invites, error } = await supabase
     .from('rfq_vendors')
@@ -108,11 +108,20 @@ router.get('/mine', verifyToken, requireRole('vendor'), async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message })
 
+  const rfqIds = invites.map((inv) => inv.rfqs?.id).filter(Boolean)
+  const { data: myQuotes, error: quotesError } = rfqIds.length
+    ? await supabase.from('quotations').select('rfq_id, status').eq('vendor_id', req.profile.id).in('rfq_id', rfqIds)
+    : { data: [], error: null }
+
+  if (quotesError) return res.status(500).json({ error: quotesError.message })
+  const quoteMap = Object.fromEntries(myQuotes.map((q) => [q.rfq_id, q.status]))
+
   const enriched = invites.map((inv) => ({
     ...inv.rfqs,
     department: inv.rfqs?.purchase_requisitions?.department,
     item_count: inv.rfqs?.rfq_items?.length ?? 0,
     responded: inv.responded,
+    quote_status: quoteMap[inv.rfqs?.id] || null,
   }))
 
   res.json(enriched)
@@ -137,9 +146,8 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   res.json(enriched)
 })
 
-// GET /api/rfqs/:id — admin (full access) or an invited vendor
-// For vendors, also attaches their own quotation (if any) so the frontend
-// can render a read-only "already quoted" view instead of the form.
+// GET /api/rfqs/:id — admin (full access, plus all quotations for comparison)
+// or an invited vendor (their own quotation only)
 router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params
 
@@ -174,7 +182,98 @@ router.get('/:id', verifyToken, async (req, res) => {
     myQuotation = quotation || null
   }
 
-  res.json({ ...rfq, my_quotation: myQuotation })
+  let quotations = []
+  if (isAdmin) {
+    const { data: allQuotes, error: quotesError } = await supabase
+      .from('quotations')
+      .select('*, quotation_items(*), profiles(full_name, company_name)')
+      .eq('rfq_id', id)
+
+    if (quotesError) return res.status(500).json({ error: quotesError.message })
+    quotations = allQuotes
+  }
+
+  res.json({ ...rfq, my_quotation: myQuotation, quotations })
+})
+
+// PATCH /api/rfqs/:id/award — admin: award to one quotation, reject the rest, lock the RFQ
+router.patch('/:id/award', verifyToken, requireRole('admin'), async (req, res) => {
+  const { id } = req.params
+  const { quotation_id } = req.body
+
+  if (!quotation_id) return res.status(400).json({ error: 'quotation_id is required.' })
+
+  const { data: rfq, error: rfqError } = await supabase
+    .from('rfqs')
+    .select('id, status')
+    .eq('id', id)
+    .single()
+
+  if (rfqError || !rfq) return res.status(404).json({ error: 'RFQ not found.' })
+  if (rfq.status !== 'open') {
+    return res.status(400).json({ error: `Cannot award an RFQ with status "${rfq.status}".` })
+  }
+
+  const { data: quotation, error: quoteError } = await supabase
+    .from('quotations')
+    .select('id, vendor_id, status')
+    .eq('id', quotation_id)
+    .eq('rfq_id', id)
+    .single()
+
+  if (quoteError || !quotation) return res.status(404).json({ error: 'Quotation not found for this RFQ.' })
+  if (quotation.status !== 'submitted') {
+    return res.status(400).json({ error: 'Only a submitted quotation can be awarded.' })
+  }
+
+  const { error: awardError } = await supabase
+    .from('quotations')
+    .update({ status: 'awarded' })
+    .eq('id', quotation_id)
+
+  if (awardError) return res.status(500).json({ error: awardError.message })
+
+  // Reject every other still-submitted quotation on this RFQ (winner is
+  // already 'awarded' at this point, so this query correctly skips it)
+  const { data: rejected, error: rejectError } = await supabase
+    .from('quotations')
+    .update({ status: 'rejected' })
+    .eq('rfq_id', id)
+    .eq('status', 'submitted')
+    .select('id, vendor_id')
+
+  if (rejectError) return res.status(500).json({ error: rejectError.message })
+
+  const { data: updatedRfq, error: rfqUpdateError } = await supabase
+    .from('rfqs')
+    .update({ status: 'awarded' })
+    .eq('id', id)
+    .select()
+    .single()
+
+  if (rfqUpdateError) return res.status(500).json({ error: rfqUpdateError.message })
+
+  notifyUser({
+    userId: quotation.vendor_id,
+    title: 'Your quote was awarded',
+    message: 'Congratulations — your quote was selected. A purchase order will follow.',
+    link: `/vendor/rfqs/${id}`,
+    entityId: id,
+    type: 'quote_awarded',
+  }).catch((err) => console.error('notifyUser failed:', err.message))
+
+  rejected.forEach((r) => {
+    notifyUser({
+      userId: r.vendor_id,
+      title: 'RFQ closed',
+      message: 'This RFQ was awarded to another vendor.',
+      link: `/vendor/rfqs/${id}`,
+      entityId: id,
+      type: 'quote_rejected',
+    }).catch((err) => console.error('notifyUser failed:', err.message))
+  })
+
+  res.json({ rfq: updatedRfq, awarded_quotation_id: quotation_id })
 })
 
 module.exports = router
