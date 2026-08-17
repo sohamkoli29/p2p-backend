@@ -1,9 +1,12 @@
 const express = require('express')
+const multer = require('multer')
 const router = express.Router()
 const supabase = require('../config/supabase')
 const verifyToken = require('../middleware/auth')
 const requireRole = require('../middleware/requireRole')
 const { notifyAdmins, notifyUser } = require('../services/notifications')
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
 // POST /api/requisitions
 router.post('/', verifyToken, requireRole('alemic'), async (req, res) => {
@@ -109,8 +112,7 @@ router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   res.json(enriched)
 })
 
-// GET /api/requisitions/:id — includes the linked Purchase Order, if this
-// requisition has been fully sourced through an awarded RFQ.
+// GET /api/requisitions/:id — now includes attachments list + linked PO
 router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params
 
@@ -134,8 +136,12 @@ router.get('/:id', verifyToken, async (req, res) => {
     .eq('id', pr.requested_by)
     .single()
 
-  // Assumes at most one awarded RFQ per requisition — true for this MVP's
-  // single sourcing pass, but would need revisiting if re-sourcing is added.
+  const { data: attachments } = await supabase
+    .from('pr_attachments')
+    .select('id, file_name, uploaded_at')
+    .eq('requisition_id', id)
+    .order('uploaded_at', { ascending: false })
+
   let purchaseOrder = null
   const { data: relatedRfq } = await supabase
     .from('rfqs')
@@ -162,7 +168,75 @@ router.get('/:id', verifyToken, async (req, res) => {
     }
   }
 
-  res.json({ ...pr, requester, purchase_order: purchaseOrder })
+  res.json({ ...pr, requester, purchase_order: purchaseOrder, attachments: attachments || [] })
+})
+
+// POST /api/requisitions/:id/attachments — alemic: upload a supporting file to their own PR
+router.post('/:id/attachments', verifyToken, requireRole('alemic'), upload.single('file'), async (req, res) => {
+  const { id } = req.params
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' })
+
+  const { data: pr, error: prError } = await supabase
+    .from('purchase_requisitions')
+    .select('id, requested_by')
+    .eq('id', id)
+    .single()
+
+  if (prError || !pr) return res.status(404).json({ error: 'Requisition not found.' })
+  if (pr.requested_by !== req.profile.id) {
+    return res.status(403).json({ error: 'You do not have access to this requisition.' })
+  }
+
+  const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_')
+  const path = `pr-attachments/${id}/${Date.now()}-${safeName}`
+
+  const { error: uploadError } = await supabase.storage
+    .from('attachments')
+    .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: false })
+
+  if (uploadError) return res.status(500).json({ error: uploadError.message })
+
+  const { data, error } = await supabase
+    .from('pr_attachments')
+    .insert({ requisition_id: id, file_path: path, file_name: req.file.originalname, uploaded_by: req.profile.id })
+    .select()
+    .single()
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.status(201).json(data)
+})
+
+// GET /api/requisitions/:id/attachments/:attachmentId/url — signed URL, admin or PR owner
+router.get('/:id/attachments/:attachmentId/url', verifyToken, async (req, res) => {
+  const { id, attachmentId } = req.params
+
+  const { data: pr, error: prError } = await supabase
+    .from('purchase_requisitions')
+    .select('id, requested_by')
+    .eq('id', id)
+    .single()
+
+  if (prError || !pr) return res.status(404).json({ error: 'Requisition not found.' })
+
+  const isAdmin = req.profile.role === 'admin'
+  const isOwner = pr.requested_by === req.profile.id
+  if (!isAdmin && !isOwner) return res.status(403).json({ error: 'You do not have access to this requisition.' })
+
+  const { data: attachment, error: attError } = await supabase
+    .from('pr_attachments')
+    .select('file_path')
+    .eq('id', attachmentId)
+    .eq('requisition_id', id)
+    .single()
+
+  if (attError || !attachment) return res.status(404).json({ error: 'Attachment not found.' })
+
+  const { data, error } = await supabase.storage
+    .from('attachments')
+    .createSignedUrl(attachment.file_path, 60 * 5)
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ url: data.signedUrl })
 })
 
 // PATCH /api/requisitions/:id — approve/reject

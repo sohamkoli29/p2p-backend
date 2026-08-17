@@ -1,9 +1,12 @@
 const express = require('express')
+const multer = require('multer')
 const router = express.Router()
 const supabase = require('../config/supabase')
 const verifyToken = require('../middleware/auth')
 const requireRole = require('../middleware/requireRole')
 const { notifyAdmins } = require('../services/notifications')
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
 // POST /api/quotations — vendor: submit a quote for an RFQ they were invited to
 router.post('/', verifyToken, requireRole('vendor'), async (req, res) => {
@@ -95,6 +98,67 @@ router.post('/', verifyToken, requireRole('vendor'), async (req, res) => {
   }).catch((err) => console.error('notifyAdmins failed:', err.message))
 
   res.status(201).json({ ...quotation, items: quotationItems })
+})
+
+// POST /api/quotations/:id/attachment — vendor: optional supporting doc for their own quote
+router.post('/:id/attachment', verifyToken, requireRole('vendor'), upload.single('file'), async (req, res) => {
+  const { id } = req.params
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' })
+
+  const { data: quotation, error: quoteError } = await supabase
+    .from('quotations')
+    .select('id, vendor_id')
+    .eq('id', id)
+    .single()
+
+  if (quoteError || !quotation) return res.status(404).json({ error: 'Quotation not found.' })
+  if (quotation.vendor_id !== req.profile.id) {
+    return res.status(403).json({ error: 'You do not have access to this quotation.' })
+  }
+
+  const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_')
+  const path = `quote-attachments/${id}/${Date.now()}-${safeName}`
+
+  const { error: uploadError } = await supabase.storage
+    .from('attachments')
+    .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: false })
+
+  if (uploadError) return res.status(500).json({ error: uploadError.message })
+
+  const { data, error } = await supabase
+    .from('quotations')
+    .update({ attachment_path: path })
+    .eq('id', id)
+    .select()
+    .single()
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
+// GET /api/quotations/:id/attachment-url — admin or the owning vendor
+router.get('/:id/attachment-url', verifyToken, async (req, res) => {
+  const { id } = req.params
+
+  const { data: quotation, error: quoteError } = await supabase
+    .from('quotations')
+    .select('vendor_id, attachment_path')
+    .eq('id', id)
+    .single()
+
+  if (quoteError || !quotation) return res.status(404).json({ error: 'Quotation not found.' })
+  if (!quotation.attachment_path) return res.status(404).json({ error: 'No attachment uploaded.' })
+
+  const isAdmin = req.profile.role === 'admin'
+  const isOwner = quotation.vendor_id === req.profile.id
+  if (!isAdmin && !isOwner) return res.status(403).json({ error: 'You do not have access to this file.' })
+
+  const { data, error } = await supabase.storage
+    .from('attachments')
+    .createSignedUrl(quotation.attachment_path, 60 * 5)
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ url: data.signedUrl })
 })
 
 module.exports = router
